@@ -1,5 +1,5 @@
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,13 @@ def _batch_reduce_loss(loss: Tensor, batch_reduction: BatchReductionType) -> Ten
         return torch.sum(loss)
     raise ValueError(
         f"Batch reduction {batch_reduction} not allowed, must be one of ['mean', 'sum']."
+    )
+
+
+def _scatter_reduce_loss(loss, batch, batch_size):
+    dev = loss.device
+    return torch.zeros(batch_size, device=dev).index_add_(
+        dim=0, index=batch, source=loss
     )
 
 
@@ -640,14 +647,16 @@ def kl_loss(
     q: Distribution,
     p: Distribution,
     mask: Optional[Tensor] = None,
+    batch: Optional[Tensor] = None,
+    batch_size: int = None,
     normalizing_const: Optional[Tensor] = None,
     batch_reduction: BatchReductionType = "mean",
 ) -> Tensor:
     r"""Compute KL divergence between two distributions with flexible axis control.
 
     This function computes the KL divergence :math:`D_{KL}(q \parallel p)` between
-    two distributions, with explicit control over which axes to sum and how to
-    apply masking.
+    two distributions. It is possible to speicfy either a mask or a batch vector to allow
+    correct computations on batched graphs.
 
     .. math::
         D_{KL}(q \parallel p) = \mathbb{E}_{x \sim q}[\log q(x) - \log p(x)]
@@ -663,6 +672,10 @@ def kl_loss(
         mask (Optional[~torch.Tensor]): A mask matrix
             :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
             the valid nodes for each graph. (default: :obj:`None`)
+        batch (~torch.Tensor, optional): The batch vector
+                :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which indicates
+                to which graph in the batch each node belongs. (default: :obj:`None`)
+        batch_size (~int, optional): The batch size
         normalizing_const (Optional[~torch.Tensor]): The normalizing constant used to scale the loss.
             It allows batch computation to ensure consistent scaling across graphs of different sizes.
             (default: :obj:`None`)
@@ -693,13 +706,22 @@ def kl_loss(
         >>> # Compute KL loss: sum over K-1 components, then over nodes
         >>> loss = kl_loss(q_sb, p_sb, mask=mask)
     """
+    # Apply mask if provided
+    if mask is not None and batch is not None:
+        raise ValueError("Cannot specify both mask and batch")
+    if batch is not None and batch_size is None:
+        raise ValueError("Batch size must be specified if batch is specified")
+
     loss = kl_divergence(q, p).sum(-1)
 
-    # Apply mask if provided
     if mask is not None:
         if not torch.all(mask):
             loss = loss * mask
-    loss = loss.sum(-1)
+        loss = loss.sum(-1)
+    elif batch is not None:
+        loss = _scatter_reduce_loss(loss, batch, batch_size)
+    else:
+        loss.sum(-1)
 
     # Normalize by the given constant
     if normalizing_const is not None:
@@ -773,9 +795,36 @@ def cluster_connectivity_prior_loss(
 
     # Normalize by the given constant
     if normalizing_const is not None:
+        bs = normalizing_const.shape[0] if normalizing_const.dim() > 0 else 1
+        prior_loss = (
+            prior_loss / bs
+        )  # to take into account the replication in the next operation
         prior_loss = prior_loss / normalizing_const  # scalar / vector = vector
 
     return _batch_reduce_loss(prior_loss, batch_reduction)
+
+
+def sparse_bce_reconstruction_loss(
+    link_prob_loigit,
+    true_y,
+    edges_batch_id: Optional[Tensor] = None,
+    batch_size=None,
+    batch_reduction: BatchReductionType = "mean",
+) -> Tuple[Tensor, Tensor | int]:
+    rec_loss = F.binary_cross_entropy_with_logits(
+        link_prob_loigit, true_y, weight=None, reduction="none"
+    )  # has size (E+NegE)
+
+    if edges_batch_id is None:
+        return rec_loss.mean(), torch.tensor(rec_loss.size(0), device=rec_loss.device)
+    else:
+        summed_loss = _scatter_reduce_loss(rec_loss, edges_batch_id, batch_size)
+        summed_count = _scatter_reduce_loss(
+            torch.ones_like(rec_loss), edges_batch_id, batch_size
+        )
+
+        loss = _batch_reduce_loss(summed_loss / summed_count, batch_reduction)
+        return loss, summed_count
 
 
 def maxcut_loss(
