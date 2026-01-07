@@ -115,8 +115,8 @@ class DenseConnectSPT(Connect):
                     s = s.squeeze(0)
                 adj_torch = adj.to_torch_sparse_coo_tensor().coalesce()
                 temp = torch.sparse.mm(adj_torch, s)
-                adj_pooled = s.transpose(-1, -2).matmul(temp)
-                adj_pooled = SparseTensor.from_dense(adj_pooled)
+                adj_pooled_dense = s.transpose(-1, -2).matmul(temp)
+                adj_pooled = SparseTensor.from_dense(adj_pooled_dense)
             else:  # we iterate over the block diagonal structure
                 # transform in edge_index representation
                 edge_index, edge_weight = connectivity_to_edge_index(
@@ -221,11 +221,11 @@ class DenseConnectSPT(Connect):
 
         if self.degree_norm:
             deg = adj_pooled.sum(dim=1)
-            deg[deg == 0] = 1.0  # Avoid division by zero
-            deg_inv_sqrt = 1.0 / deg.sqrt()
+            deg = deg.clamp(min=1.0)  # Avoid small degrees that explode gradients
 
             # Recompute values to apply D^{-1/2} * A * D^{-1/2}
             row, col, val = adj_pooled.coo()
+            deg_inv_sqrt = deg.pow(-0.5)
             val = val * deg_inv_sqrt[row] * deg_inv_sqrt[col]
 
             adj_pooled = SparseTensor(
