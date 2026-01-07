@@ -61,7 +61,7 @@ pooler_map = {
     "nopool": NoPool,
     "pan": PANPooling,
     "sag": SAGPooling,
-    "sparsebnpool": SparseBNPool,
+    "spbnpool": SparseBNPool,
     "topk": TopkPooling,
 }
 

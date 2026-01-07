@@ -105,11 +105,12 @@ class DPSelect(DenseSelect):
 
         Args:
             stick_fractions (torch.Tensor): A tensor representing the stick fractions
-                across dimensions [n_particles, batch, n_nodes, n_clusters-1]. Each
-                value must be within the interval (0, 1).
+                with shape :math:`[..., K-1]`. Each value must be within the
+                interval (0, 1).
 
         Returns:
-            torch.Tensor: A tensor containing the cluster assignment probabilities [batch, n_nodes, n_clusters].
+            torch.Tensor: A tensor containing the cluster assignment probabilities
+                with shape :math:`[..., K]`.
         """
         out_size = stick_fractions.size()
         device = stick_fractions.device
@@ -151,10 +152,10 @@ class DPSelect(DenseSelect):
         Returns:
             :class:`~tgp.select.SelectOutput`: The output of :math:`\texttt{select}` operator.
         """
+        x = x.unsqueeze(0) if x.dim() == 2 else x  # dense case requires batch dimension
         s, q_z = self._inner_forward(x)
 
         if mask is not None:
-            # we are in the dense case
             s = s * mask.unsqueeze(-1)
 
         return SelectOutput(s=s, s_inv_op=self.s_inv_op, mask=mask, q_z=q_z)
@@ -170,36 +171,45 @@ class DPSelectSparse(DPSelect):
         with a sparse graphs representation, i.e., the input tensor :obj:`"x"` is expected to
         be of shape :math:`\mathbb{R}^{N \times F}`.
 
-        Therefore, the shape of the assignment matrix :math:`\mathbf{S}` is :math:`\mathbb{R}^{N \times (B \times K)}`.
+        If :obj:`batch` is provided, the assignment matrix :math:`\mathbf{S}` is returned as a
+        block-diagonal :class:`~torch_sparse.SparseTensor` of shape
+        :math:`\mathbb{R}^{N \times (B \times K)}`. If :obj:`batch` is :obj:`None`, the method
+        returns a dense assignment matrix of shape :math:`\mathbb{R}^{N \times K}`.
 
         Args:
             x (~torch.Tensor): Node feature tensor
-                :math:`\mathbf{X} \in \mathbb{R}^{B \times N \times F}`, with
-                batch-size :math:`B`, (maximum) number of nodes :math:`N` for
-                each graph, and feature dimension :math:`F`.
-                Note that the node assignment matrix
-                :math:`\mathbf{S} \in \mathbb{R}^{B \times N \times K}` is
-                being created within this method.
+                :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`, where :math:`N`
+                is the total number of nodes in the batch and :math:`F` is the
+                feature dimension.
             batch (~torch.Tensor, optional): The batch vector
                 :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which indicates
-                to which graph in the batch each node belongs.
-                (default: :obj:`None`)
+                to which graph in the batch each node belongs. If all entries
+                are equal (single-graph batch), pass :obj:`None` instead to
+                trigger the dense path. (default: :obj:`None`)
 
         Returns:
             :class:`~tgp.select.SelectOutput`: The output of :math:`\texttt{select}` operator.
         """
         s, q_z = self._inner_forward(x)
 
-        if batch is None:
-            batch = torch.zeros(
-                x.size(0), dtype=torch.long, device=x.device
-            )  # only one batch
+        if batch is None:  # dense case
+            return SelectOutput(s=s, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s)
 
-        # we are in the sparse case, shas shape NxK
+        # Cannot pass explicit single-graph batch
+        if batch.numel() > 0:
+            batch_min = int(batch.min().item())
+            batch_max = int(batch.max().item())
+            if batch_min == batch_max:
+                raise ValueError(
+                    "DPSelectSparse received an explicit single-graph batch. "
+                    "For a single graph, pass batch=None to use the dense path."
+                )
+
+        # sparse case
         dev = x.device
         row = torch.arange(x.size(0), device=dev).view(-1, 1).repeat(1, self.k).view(-1)
         col = (self.k * batch.view(-1, 1) + torch.arange(self.k, device=dev)).view(-1)
-        # s_block = torch.sparse_coo_tensor(values=s.view(-1), indices=torch.stack([row, col], dim=0), is_coalesced=True)
+        # s_block = torch.sparse_coo_tensor(values=s.view(-1), indices=torch.stack([row, col], dim=0), is_coalesced=True) # TODO: this will be used in the new version of TGP without torch_sparse. Leave it here commented for now
         s_block = torch_sparse.SparseTensor(row=row, col=col, value=s.view(-1))
         return SelectOutput(
             s=s_block, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s

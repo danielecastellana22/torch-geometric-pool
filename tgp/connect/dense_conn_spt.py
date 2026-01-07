@@ -15,13 +15,14 @@ from tgp.utils import connectivity_to_edge_index, connectivity_to_sparse_tensor
 class DenseConnectSPT(Connect):
     r"""A :math:`\texttt{connect}` operator to be used when the assignment matrix
     :math:`\mathbf{S}` in the :class:`~tgp.select.SelectOutput` is a :class:`SparseTensor`
-    with a block diagonal structure, and each block is dense.
+    with a block diagonal structure, and each block is dense. For single-graph
+    batches, :math:`\mathbf{S}` may be provided as a dense tensor.
 
     The pooled adjacency matrix is computed as:
 
     .. math::
         \mathbf{A}_{\mathrm{pool}} =
-        \mathbf{S}^{\top}\mathbf{A}\mathbf{S}_{\mathrm{inv}}^{\top}
+        \mathbf{S}^{\top}\mathbf{A}\mathbf{S}
 
     Args:
         remove_self_loops (bool, optional):
@@ -95,21 +96,28 @@ class DenseConnectSPT(Connect):
         if isinstance(edge_index, (SparseTensor, Tensor)):
             if isinstance(edge_index, Tensor):
                 convert_back = True
+            if edge_weight is not None and edge_weight.dim() > 1:
+                edge_weight = edge_weight.view(-1)
 
             BS = 1 if batch is None else batch.max().item() + 1
 
-            if BS == 1:
-                # we canno use the for computation, we compute it as before
-                adj = connectivity_to_sparse_tensor(
-                    edge_index, edge_weight
-                ).to_torch_sparse_coo_tensor()
-                sos = so.s.to_torch_sparse_coo_tensor()
-                temp = torch.sparse.mm(sos.transpose(-1, -2), adj)
-                adj_pooled = torch.sparse.mm(temp, sos)
-                adj_pooled = SparseTensor.from_torch_sparse_coo_tensor(adj_pooled)
-            else:
-                # we iterate over the block diagonal structure
-
+            if BS == 1:  # There is only one graph, no need to iterate
+                adj = connectivity_to_sparse_tensor(edge_index, edge_weight)
+                if isinstance(so.s, SparseTensor):
+                    s = so.s.to_dense()
+                else:
+                    s = so.s
+                if s.dim() == 3:
+                    if s.size(0) != 1:
+                        raise ValueError(
+                            "DenseConnectSPT expects a 2D assignment matrix for a single graph."
+                        )
+                    s = s.squeeze(0)
+                adj_torch = adj.to_torch_sparse_coo_tensor().coalesce()
+                temp = torch.sparse.mm(adj_torch, s)
+                adj_pooled = s.transpose(-1, -2).matmul(temp)
+                adj_pooled = SparseTensor.from_dense(adj_pooled)
+            else:  # we iterate over the block diagonal structure
                 # transform in edge_index representation
                 edge_index, edge_weight = connectivity_to_edge_index(
                     edge_index, edge_weight
@@ -120,45 +128,67 @@ class DenseConnectSPT(Connect):
                 if edge_weight is None:
                     edge_weight = torch.ones(E, device=dev)
 
-                sos = (
-                    so.s.to_torch_sparse_coo_tensor()
-                )  # this is sparse and has shape N x (BS*K)
-                K = sos.size(1) // BS
-                vals = sos._values()
-                idx = sos._indices()
-                idx[1] = idx[1] % K
-                s = torch.sparse_coo_tensor(indices=idx, values=vals).to_dense()
-                # assert s.is_coalesced()
-                # s=s.to_dense()
+                if isinstance(so.s, SparseTensor):
+                    sos = (
+                        so.s.to_torch_sparse_coo_tensor().coalesce()
+                    )  # this is sparse and has shape N x (B*K)
+                    if sos.size(1) % BS != 0:
+                        raise ValueError(
+                            "DenseConnectSPT expects a block-diagonal assignment matrix "
+                            "with second dimension divisible by the batch size."
+                        )
+                    K = sos.size(1) // BS
+                    vals = sos._values()
+                    idx = sos._indices().clone()
+                    idx[1] = idx[1] % K
+                    s = torch.sparse_coo_tensor(
+                        indices=idx, values=vals, size=(sos.size(0), K)
+                    ).to_dense()  # N x K
+                else:
+                    s = so.s
+                    if s.dim() != 2:
+                        raise ValueError(
+                            "DenseConnectSPT expects a 2D assignment matrix for batched graphs."
+                        )
+                    K = s.size(1)
 
-                unbatched_s = unbatch(s, batch=batch)
-                unbatched_adj = unbatch_edge_index(edge_index, batch=batch)
+                unbatched_s = unbatch(
+                    s, batch=batch
+                )  # list of B elements, each of shape Ni x K
+                unbatched_adj = unbatch_edge_index(
+                    edge_index, batch=batch
+                )  # list of B elements, each of shape 2 x Ei
+                if E == 0:
+                    unbatched_edge_weight = [
+                        edge_weight.new_empty(0) for _ in range(BS)
+                    ]
+                else:
+                    edge_batch = batch[edge_index[0]]
+                    unbatched_edge_weight = unbatch(edge_weight, batch=edge_batch)
 
                 out_list = []
-                cont = 0
-                for i in range(len(unbatched_s)):
-                    unb_adj_i = unbatched_adj[i]
-                    unb_s = unbatched_s[i]
-                    E_i = unb_adj_i.shape[-1]
-                    N_i = unb_s.shape[0]
-
-                    vals = edge_weight[cont : cont + E_i]
-                    cont += E_i
+                for unb_adj_i, unb_s, unb_w in zip(
+                    unbatched_adj, unbatched_s, unbatched_edge_weight
+                ):
+                    N_i = unb_s.size(0)
 
                     sp_unb_adj = torch.sparse_coo_tensor(
                         indices=unb_adj_i,
-                        values=vals,
+                        values=unb_w,
                         size=(N_i, N_i),
-                    )
+                    ).coalesce()
 
-                    temp = sp_unb_adj @ unb_s
-                    out = unb_s.t() @ temp
+                    temp = torch.sparse.mm(sp_unb_adj, unb_s)
+                    out = unb_s.t().matmul(temp)
                     out_list.append(out)
 
+                # Build a sparse B*K x B*K block diagonal matrix from a list of B dense K x K matrices
                 new_vals = torch.stack(out_list, dim=0)
                 zero_mask = torch.logical_not(
-                    torch.isclose(new_vals, torch.tensor(0.0, device=dev))
-                ).view(-1)
+                    torch.isclose(new_vals, new_vals.new_zeros(()))
+                ).view(
+                    -1
+                )  # Filter small values to avoid storing zeros in sparse tensor
                 new_vals = new_vals.view(-1)[zero_mask]
                 aux = (torch.arange(BS, device=dev) * K).view(-1, 1) + torch.arange(
                     K, device=dev
@@ -168,12 +198,12 @@ class DenseConnectSPT(Connect):
                 )
                 new_cols = aux.view(-1, K).repeat(1, K).view(-1)[zero_mask]
 
-                adj_pooled = torch.sparse_coo_tensor(
-                    values=new_vals,
-                    indices=torch.stack([new_rows, new_cols], dim=0),
+                adj_pooled = SparseTensor(
+                    row=new_rows,
+                    col=new_cols,
+                    value=new_vals,
+                    sparse_sizes=(BS * K, BS * K),
                 ).coalesce()
-
-                adj_pooled = SparseTensor.from_torch_sparse_coo_tensor(adj_pooled)
         else:
             raise ValueError(
                 f"Edge index must be of type {Adj}, got {type(edge_index)}"
