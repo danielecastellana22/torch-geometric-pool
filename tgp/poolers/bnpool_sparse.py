@@ -27,6 +27,17 @@ class SparseBNPool(SRCPooling):
     r"""A sparse implementation of the BN-Pool operator from the paper `"BN-Pool: Bayesian Nonparametric Graph Pooling" <https://arxiv.org/abs/2501.09821>`_
     (Castellana & Bianchi, 2025). See :class:`~tgp.poolers.BNPool` for more details.
 
+    This sparse implementation implements the BN-Pool operator with a sparse adjacency matrix,
+    computing the reconstruction loss on a subset of all possible edges to reduce
+    computational complexity, making it more efficient for large sparse graphs.
+
+    + The :math:`\texttt{select}` operator is implemented with :class:`~tgp.select.DPSelectSparse` to perform variational inference of the stick-breaking process on sparse graphs.
+    + The :math:`\texttt{reduce}` operator is implemented with :class:`~tgp.reduce.BaseReduce`.
+    + The :math:`\texttt{connect}` operator is implemented with :class:`~tgp.connect.DenseConnectSPT`.
+    + The :math:`\texttt{lift}` operator is implemented with :class:`~tgp.lift.BaseLift`.
+
+    For a dense implementation that works with dense adjacency tensors, see :class:`~tgp.poolers.BNPool`.
+
     Args:
         in_channels (Union[int, List[int]]): The number of input node feature channels.
             If a list is provided, it specifies the architecture of the MLP in :class:`~tgp.select.DPSelect`.
@@ -44,8 +55,8 @@ class SparseBNPool(SRCPooling):
             (default: :obj:`1.0`)
         eta (float, optional): Weights the KL divergence loss term.
             (default: :obj:`1.0`)
-        rescale_loss (bool, optional): If :obj:`True`, losses are normalized by the square of the number of nodes :math:`N^2`
-            to ensure proper scaling across different graph sizes.
+        rescale_loss (bool, optional): If :obj:`True`, losses are normalized by the number of sampled edges
+            :math:`E + E_{\text{neg}}` to ensure proper scaling across different graph sizes.
             (default: :obj:`True`)
         train_K (bool, optional): If :obj:`True`, the cluster connectivity matrix :math:`\mathbf{K}` is learnable.
             If :obj:`False`, :math:`\mathbf{K}` is fixed to its initial value.
@@ -54,6 +65,15 @@ class SparseBNPool(SRCPooling):
             (default: :obj:`None`)
         dropout (float, optional): Dropout rate in the MLP of :class:`~tgp.select.DPSelect`.
             (default: :obj:`0.0`)
+        remove_self_loops (bool, optional):
+            If :obj:`True`, the self-loops will be removed from the pooled adjacency matrix.
+            (default: :obj:`True`)
+        degree_norm (bool, optional):
+            If :obj:`True`, the pooled adjacency matrix will be symmetrically normalized.
+            (default: :obj:`True`)
+        edge_weight_norm (bool, optional):
+            Whether to normalize the pooled edge weights by dividing by the maximum absolute value per graph.
+            (default: :obj:`False`)
         adj_transpose (bool, optional):
             If :obj:`True`, the preprocessing step in :class:`tgp.src.DenseSRCPooling` and
             the :class:`tgp.connect.DenseConnect` operation returns transposed
@@ -90,10 +110,12 @@ class SparseBNPool(SRCPooling):
         K_mu=10.0,
         K_init=1.0,
         eta=1.0,
-        rescale_loss=True,
         train_K=True,  # hyperparameters of the selector
         act: str = None,
         dropout: float = 0.0,
+        remove_self_loops: bool = True,
+        degree_norm: bool = True,
+        edge_weight_norm: bool = False,
         adj_transpose: bool = True,
         lift: LiftType = "precomputed",
         s_inv_op: SinvType = "transpose",
@@ -114,7 +136,11 @@ class SparseBNPool(SRCPooling):
             selector=DPSelectSparse(in_channels, k, act, dropout, s_inv_op),
             reducer=BaseReduce(),
             lifter=BaseLift(matrix_op=lift),
-            connector=DenseConnectSPT(remove_self_loops=True, degree_norm=True),
+            connector=DenseConnectSPT(
+                remove_self_loops=remove_self_loops,
+                degree_norm=degree_norm,
+                edge_weight_norm=edge_weight_norm,
+            ),
         )
         self.adj_transpose = adj_transpose
         self.k = k
@@ -122,7 +148,6 @@ class SparseBNPool(SRCPooling):
         self.alpha_DP = alpha_DP
         self.K_var_val = K_var
         self.K_mu_val = K_mu
-        self.rescale_loss = rescale_loss
         self.train_K = train_K
         self.eta = eta  # coefficient for the kl_loss
 
@@ -219,7 +244,7 @@ class SparseBNPool(SRCPooling):
     def compute_loss(self, adj, batch, so) -> dict:
         r"""Computes the loss components for BN-Pool training. See :class:`~tgp.poolers.BNPool` for more details.
 
-        In this implementaion, the reconstruction loss is not computed on all the possible edges to reduce the complexity.
+        In this implementaion, the reconstruction loss is computed on a subset of all the possible edges to reduce the complexity.
 
         Args:
             adj (~torch_geometric.typing.Adj, optional): The connectivity matrix.
@@ -301,6 +326,9 @@ class SparseBNPool(SRCPooling):
             "eta": self.eta,
             "rescale_loss": self.rescale_loss,
             "train_K": self.train_K,
+            "remove_self_loops": self.connector.remove_self_loops,
+            "degree_norm": self.connector.degree_norm,
+            "edge_weight_norm": self.connector.edge_weight_norm,
         }
 
     def get_sparse_rec_loss(self, node_assignment, adj, batch, bs):
@@ -332,7 +360,10 @@ class SparseBNPool(SRCPooling):
         )
 
         return sparse_bce_reconstruction_loss(
-            link_prob_loigit, pred_y, edges_batch_id=edges_batch_id, batch_size=bs
+            link_prob_loigit,
+            pred_y,
+            edges_batch_id=edges_batch_id,
+            batch_size=bs,
         )
 
     def get_prob_link_logit(self, node_assignment, edges_list):

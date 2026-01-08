@@ -811,19 +811,41 @@ def sparse_bce_reconstruction_loss(
     batch_size=None,
     batch_reduction: BatchReductionType = "mean",
 ) -> Tuple[Tensor, Tensor | int]:
+    r"""Sparse weighted binary cross-entropy reconstruction loss for sampled edges.
+
+    Args:
+        link_prob_loigit (~torch.Tensor): Logits for sampled edges of shape :math:`[E]`.
+        true_y (~torch.Tensor): Ground-truth labels for sampled edges of shape :math:`[E]`.
+        edges_batch_id (~torch.Tensor, optional): Batch assignment for each sampled edge.
+            (default: :obj:`None`)
+        batch_size (int, optional): Number of graphs in the batch.
+        batch_reduction (str, optional): Reduction applied across graphs.
+            Can be :obj:`'mean'` or :obj:`'sum'`. (default: :obj:`"mean"`)
+
+    Returns:
+        Tuple[~torch.Tensor, ~torch.Tensor | int]: The loss value and the number
+        of sampled edges (per-graph counts if :obj:`edges_batch_id` is provided).
+    """
     rec_loss = F.binary_cross_entropy_with_logits(
         link_prob_loigit, true_y, weight=None, reduction="none"
     )  # has size (E+NegE)
 
+    # Global (single-graph) case: mean over sampled edges, optional rescale by a normalizer.
     if edges_batch_id is None:
-        return rec_loss.mean(), torch.tensor(rec_loss.size(0), device=rec_loss.device)
+        count = torch.tensor(
+            rec_loss.size(0), device=rec_loss.device, dtype=rec_loss.dtype
+        )
+        loss = rec_loss.mean()
+        return loss, count
     else:
+        # Batched case: per-graph mean, then rescale by sampled-edge count / normalizer.
         summed_loss = _scatter_reduce_loss(rec_loss, edges_batch_id, batch_size)
         summed_count = _scatter_reduce_loss(
             torch.ones_like(rec_loss), edges_batch_id, batch_size
         )
-
-        loss = _batch_reduce_loss(summed_loss / summed_count, batch_reduction)
+        summed_count = torch.clamp(summed_count, min=1)
+        per_graph = summed_loss / summed_count
+        loss = _batch_reduce_loss(per_graph, batch_reduction)
         return loss, summed_count
 
 

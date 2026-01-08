@@ -7,6 +7,7 @@ from torch_geometric.utils import unbatch, unbatch_edge_index
 from torch_scatter import scatter
 from torch_sparse import SparseTensor
 
+from tgp import eps
 from tgp.connect import Connect
 from tgp.select import SelectOutput
 from tgp.utils import connectivity_to_edge_index, connectivity_to_sparse_tensor
@@ -219,9 +220,21 @@ class DenseConnectSPT(Connect):
                 row=row, col=col, value=val, sparse_sizes=adj_pooled.sparse_sizes()
             )
 
+        # Drop near-zero edges to avoid tiny degrees and keep the graph sparse.
+        row, col, val = adj_pooled.coo()
+        if val is not None:
+            mask = val.abs() > eps
+            if not torch.all(mask):
+                adj_pooled = SparseTensor(
+                    row=row[mask],
+                    col=col[mask],
+                    value=val[mask],
+                    sparse_sizes=adj_pooled.sparse_sizes(),
+                ).coalesce()
+
         if self.degree_norm:
             deg = adj_pooled.sum(dim=1)
-            deg = deg.clamp(min=1.0)  # Avoid small degrees that explode gradients
+            deg[deg == 0] = eps  # Avoid division by zero
 
             # Recompute values to apply D^{-1/2} * A * D^{-1/2}
             row, col, val = adj_pooled.coo()
