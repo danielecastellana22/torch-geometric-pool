@@ -150,6 +150,55 @@ def test_sparse_bnpool_training_modeon_single_graph(single_sparse_graph, train_k
         assert pooler.K.grad is None
 
 
+@pytest.mark.parametrize("train_k", [True, False])
+def test_sparse_bnpool_single_graph_with_batch_vector(single_sparse_graph, train_k):
+    """Test BNPool with a single graph that has a batch vector (all values same).
+
+    This tests the new behavior where DPSelectSparse automatically uses the dense
+    path for single-graph batches, which is useful when DataLoaders produce
+    single-graph batches (e.g., last batch when batch_size * N + 1 graphs).
+    """
+    s_graph = single_sparse_graph
+    x, edge_index = s_graph.x, s_graph.edge_index
+    N = x.size(0)
+
+    # Create a batch vector where all values are the same (single graph in batch format)
+    batch = torch.zeros(N, dtype=torch.long)
+
+    pooler = SparseBNPool(in_channels=x.shape[-1], k=3, train_K=train_k)
+    pooler.train()
+
+    # Enable gradient tracking
+    x.requires_grad_(True)
+
+    # Forward pass with batch vector (should use dense path automatically)
+    out = pooler(x=x, adj=edge_index, batch=batch)
+
+    # Check if loss components are present
+    assert isinstance(out.loss, dict)
+    assert "quality" in out.loss
+    assert "kl" in out.loss
+    assert "K_prior" in out.loss
+
+    # Check output shapes - should be k supernodes (not batch_size * k)
+    k = pooler.k
+    assert out.x.shape[0] == k, (
+        "For single graph with batch vector, should have k supernodes (not batch_size * k)"
+    )
+    assert out.x.shape[1] == x.shape[1]
+
+    # Check if losses are differentiable
+    total_loss = sum(out.loss.values())
+    total_loss.backward()
+
+    # Check if gradients are computed
+    assert x.grad is not None
+    if pooler.train_K:
+        assert pooler.K.grad is not None
+    else:
+        assert pooler.K.grad is None
+
+
 def test_sparse_bnpool_eval_mode(small_batched_sparse_graphs):
     batched_graphs = small_batched_sparse_graphs
     x, edge_index, batch = (

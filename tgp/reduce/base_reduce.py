@@ -34,12 +34,32 @@ class Reduce(nn.Module):
         if batch is None:
             return batch
 
-        assert isinstance(select_output.s, SparseTensor)
-
-        out = torch.arange(select_output.num_supernodes, device=batch.device)
-        return out.scatter_(
-            0, select_output.cluster_index, batch[select_output.node_index]
-        )
+        if isinstance(select_output.s, SparseTensor):
+            out = torch.arange(select_output.num_supernodes, device=batch.device)
+            return out.scatter_(
+                0, select_output.cluster_index, batch[select_output.node_index]
+            )
+        else:
+            # For dense tensors with batch, check if it's a single graph
+            # (all batch values are the same). In this case, all supernodes
+            # belong to the same graph.
+            if batch.numel() > 0:
+                batch_min = int(batch.min().item())
+                batch_max = int(batch.max().item())
+                if batch_min == batch_max:
+                    # Single graph: all supernodes belong to the same graph
+                    return torch.full(
+                        (select_output.num_supernodes,),
+                        batch_min,
+                        dtype=batch.dtype,
+                        device=batch.device,
+                    )
+            # For multi-graph dense batches, this shouldn't happen in practice
+            # as dense poolers typically handle batching differently
+            raise ValueError(
+                "Dense SelectOutput with multi-graph batch is not supported. "
+                "Use sparse representation for multi-graph batches."
+            )
 
     def reset_parameters(self):
         r"""Resets all learnable parameters of the module."""

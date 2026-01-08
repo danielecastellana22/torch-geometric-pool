@@ -171,10 +171,12 @@ class DPSelectSparse(DPSelect):
         with a sparse graphs representation, i.e., the input tensor :obj:`"x"` is expected to
         be of shape :math:`\mathbb{R}^{N \times F}`.
 
-        If :obj:`batch` is provided, the assignment matrix :math:`\mathbf{S}` is returned as a
-        block-diagonal :class:`~torch_sparse.SparseTensor` of shape
-        :math:`\mathbb{R}^{N \times (B \times K)}`. If :obj:`batch` is :obj:`None`, the method
-        returns a dense assignment matrix of shape :math:`\mathbb{R}^{N \times K}`.
+        If :obj:`batch` is provided and contains multiple graphs (different batch values),
+        the assignment matrix :math:`\mathbf{S}` is returned as a block-diagonal
+        :class:`~torch_sparse.SparseTensor` of shape :math:`\mathbb{R}^{N \times (B \times K)}`.
+        If :obj:`batch` is provided but all entries are equal (single-graph batch), or if
+        :obj:`batch` is :obj:`None`, the method returns a dense assignment matrix of shape
+        :math:`\mathbb{R}^{N \times K}` (using the dense path for efficiency).
 
         Args:
             x (~torch.Tensor): Node feature tensor
@@ -183,29 +185,31 @@ class DPSelectSparse(DPSelect):
                 feature dimension.
             batch (~torch.Tensor, optional): The batch vector
                 :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which indicates
-                to which graph in the batch each node belongs. If all entries
-                are equal (single-graph batch), pass :obj:`None` instead to
-                trigger the dense path. (default: :obj:`None`)
+                to which graph in the batch each node belongs. Single-graph batches
+                (where all entries are equal) automatically use the dense representation
+                for efficiency.
+                (default: :obj:`None`)
 
         Returns:
             :class:`~tgp.select.SelectOutput`: The output of :math:`\texttt{select}` operator.
         """
         s, q_z = self._inner_forward(x)
 
-        if batch is None:  # dense case
+        # Single-graph batch: use dense path (more efficient than sparse for single graph)
+        if batch is None:
             return SelectOutput(s=s, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s)
 
-        # Cannot pass explicit single-graph batch
+        # Check if it's a single-graph batch (all batch values are the same)
         if batch.numel() > 0:
             batch_min = int(batch.min().item())
             batch_max = int(batch.max().item())
             if batch_min == batch_max:
-                raise ValueError(
-                    "DPSelectSparse received an explicit single-graph batch. "
-                    "For a single graph, pass batch=None to use the dense path."
+                # Single graph: use dense path (more efficient than sparse for single graph)
+                return SelectOutput(
+                    s=s, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s
                 )
 
-        # sparse case
+        # Multi-graph batch: use sparse case (block-diagonal structure)
         dev = x.device
         row = torch.arange(x.size(0), device=dev).view(-1, 1).repeat(1, self.k).view(-1)
         col = (self.k * batch.view(-1, 1) + torch.arange(self.k, device=dev)).view(-1)
