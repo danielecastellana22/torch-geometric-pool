@@ -324,7 +324,6 @@ class SparseBNPool(SRCPooling):
             "k_prior_mean": self.K_mu_val,
             "k_init_value": self.K_init_val,
             "eta": self.eta,
-            "rescale_loss": self.rescale_loss,
             "train_K": self.train_K,
             "remove_self_loops": self.connector.remove_self_loops,
             "degree_norm": self.connector.degree_norm,
