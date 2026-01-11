@@ -721,7 +721,7 @@ def kl_loss(
     elif batch is not None:
         loss = _scatter_reduce_loss(loss, batch, batch_size)
     else:
-        loss.sum(-1)
+        loss = loss.sum(-1)
 
     # Normalize by the given constant
     if normalizing_const is not None:
