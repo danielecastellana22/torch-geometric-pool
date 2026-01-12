@@ -108,7 +108,7 @@ def test_output_with_spt_adj(simple_graph, pooler_name):
     x_pre, adj_pre, mask = pooler.preprocessing(
         edge_index=adj, edge_weight=edge_weight, x=x, batch=batch, use_cache=False
     )
-    if pooler.is_dense:
+    if pooler.is_dense_batched:
         assert isinstance(adj_pre, torch.Tensor) and adj_pre.ndim == 3
     else:
         # For sparse poolers, adj_pre can be either SparseTensor or Tensor (edge_index format)
@@ -116,7 +116,7 @@ def test_output_with_spt_adj(simple_graph, pooler_name):
 
     # Pooling operation
     out = pooler(x=x_pre, adj=adj_pre, batch=batch, mask=mask)
-    if pooler.is_dense:
+    if pooler.is_dense_batched:
         assert isinstance(out.edge_index, torch.Tensor)
     else:
         # For sparse poolers, edge_index can be either SparseTensor or Tensor
@@ -124,7 +124,10 @@ def test_output_with_spt_adj(simple_graph, pooler_name):
 
     # lift
     x_pool = out.x.clone()
-    x_lifted = pooler(x=x_pool, so=out.so, lifting=True)
+    lift_kwargs = {}
+    if pooler_name in {"lap", "spbnpool"}:
+        lift_kwargs["batch_pooled"] = out.batch
+    x_lifted = pooler(x=x_pool, so=out.so, lifting=True, **lift_kwargs)
     assert isinstance(x_lifted, torch.Tensor)
     # For batched graphs, the lifted features should match the number of nodes
     # that the SelectOutput knows about. Some poolers may only lift one graph at a time

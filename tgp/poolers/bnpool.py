@@ -156,7 +156,14 @@ class BNPool(DenseSRCPooling):
             raise ValueError("max_k must be positive")
 
         super(BNPool, self).__init__(
-            selector=DPSelect(in_channels, k, act, dropout, s_inv_op),
+            selector=DPSelect(
+                in_channels,
+                k,
+                batched_representation=True,
+                act=act,
+                dropout=dropout,
+                s_inv_op=s_inv_op,
+            ),
             reducer=BaseReduce(),
             lifter=BaseLift(matrix_op=lift),
             connector=DenseConnect(

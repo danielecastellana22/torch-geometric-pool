@@ -15,7 +15,7 @@ dataset = Planetoid(root="data/Planetoid", name="Cora")
 data = dataset[0]
 
 for POOLER, value in pooler_map.items():  # Use all poolers
-    # for POOLER in ['spbnpool']:                 # Test a specific pooler
+    # for POOLER in ['bnpool']:                 # Test a specific pooler
 
     print(f"Using pooler: {POOLER}")
 
@@ -56,7 +56,7 @@ for POOLER, value in pooler_map.items():  # Use all poolers
                 print(self.pooler)
                 self.pooler.reset_parameters()
 
-                if self.pooler.is_dense:
+                if self.pooler.is_dense_batched:
                     self.conv_pool = DenseGCNConv(hidden_channels, hidden_channels // 2)
                     self.conv_dec = DenseGCNConv(
                         hidden_channels // 2, dataset.num_classes
@@ -91,10 +91,12 @@ for POOLER, value in pooler_map.items():  # Use all poolers
                 x_pool = F.dropout(x_pool, p=self.dropout, training=self.training)
 
                 # Decoder
-                x_lift = self.pooler(x=x_pool, so=out.so, lifting=True)
+                x_lift = self.pooler(
+                    x=x_pool, so=out.so, lifting=True, batch_pooled=out.batch
+                )
                 x = self.conv_dec(x_lift, edge_index)
 
-                if self.pooler.is_dense:
+                if self.pooler.is_dense_batched:
                     x = x[0]
                 if out.loss is not None:
                     return F.log_softmax(x, dim=-1), sum(out.get_loss_value())

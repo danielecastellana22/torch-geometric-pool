@@ -2,7 +2,6 @@ from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
-import torch_sparse
 from torch import Tensor
 from torch.distributions import Beta
 
@@ -35,7 +34,7 @@ class DPSelect(DenseSelect):
 
     The procedure can be summarized as follows:
 
-    1. **Feature Processing**: Node features :math:`\mathbf{X} \in \mathbb{R}^{B \times N \times F}` are processed
+    1. **Feature Processing**: Node features are processed
        by an MLP to produce :math:`2(K-1)` outputs per node.
 
     2. **Parameter Extraction**: The MLP output is split into :math:`\boldsymbol{\alpha}` and :math:`\boldsymbol{\beta}`
@@ -44,8 +43,7 @@ class DPSelect(DenseSelect):
     3. **Sampling**: Stick-breaking fractions are obtained from the sampling procedure implemented in :class:`~torch.distributions.beta.Beta`:
        :math:`v_{ik} = \text{Beta}(\alpha_{ik}, \beta_{ik}).rsample()`.
 
-    4. **Cluster Assignment**: The assignment matrix :math:`\mathbf{S} \in \mathbb{R}^{B \times N \times K}`
-       is computed via the stick-breaking construction: :math:`S_{bik} = \pi_{bik}`.
+    4. **Cluster Assignment**: The assignment matrix is computed via the stick-breaking construction.
 
     Args:
         in_channels (int, list of int):
@@ -56,6 +54,13 @@ class DPSelect(DenseSelect):
         k (int):
             Maximum number of clusters :math:`K`. The actual number of active clusters is learned
             through the stick-breaking process.
+        batched_representation (bool, optional):
+            If :obj:`True`, expects batched input :math:`\mathbf{X} \in \mathbb{R}^{B \times N \times F}`
+            and returns assignment matrix :math:`\mathbf{S} \in \mathbb{R}^{B \times N \times K}`.
+            If :obj:`False`, expects unbatched input :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`
+            where :math:`N` is the total number of nodes across all graphs, and returns
+            assignment matrix :math:`\mathbf{S} \in \mathbb{R}^{N \times K}`.
+            (default: :obj:`True`)
         act (str or Callable, optional):
             Activation function in the hidden layers of the
             :class:`~torch_geometric.nn.models.mlp.MLP`.
@@ -82,6 +87,7 @@ class DPSelect(DenseSelect):
         self,
         in_channels: Union[int, List[int]],
         k: int,
+        batched_representation: bool = True,
         act: str = None,
         dropout: float = 0.0,
         s_inv_op: SinvType = "transpose",
@@ -95,6 +101,11 @@ class DPSelect(DenseSelect):
             s_inv_op=s_inv_op,
         )
         self.k = k
+        self.batched_representation = batched_representation
+
+    @property
+    def is_dense_batched(self) -> bool:
+        return self.batched_representation
 
     @staticmethod
     def _compute_pi_given_sticks(stick_fractions):
@@ -129,92 +140,48 @@ class DPSelect(DenseSelect):
         return s, q_z
 
     def forward(
-        self, x: Tensor, mask: Optional[Tensor] = None, **kwargs
+        self,
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+        batch: Optional[Tensor] = None,
+        **kwargs,
     ) -> SelectOutput:
-        r"""Applies the Dirichlet Process selection operator to compute cluster assignments. This select operator works
-        with the dense graph representation, i.e., the input tensor :obj:`"x"` is expected to
-        be of shape :math:`\mathbb{R}^{B \times N \times F}`.
-
-        Therefore, the shape of the assignment matrix :math:`\mathbf{S}` is :math:`\mathbb{R}^{B \times N \times K}`.
+        r"""Applies the Dirichlet Process selection operator to compute cluster assignments.
 
         Args:
-            x (~torch.Tensor): Node feature tensor
-                :math:`\mathbf{X} \in \mathbb{R}^{B \times N \times F}`, with
-                batch-size :math:`B`, (maximum) number of nodes :math:`N` for
-                each graph, and feature dimension :math:`F`.
-                Note that the node assignment matrix
-                :math:`\mathbf{S} \in \mathbb{R}^{B \times N \times K}` is
-                being created within this method.
-            mask (~torch.Tensor, optional): Mask matrix
-                :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}` indicating
-                the valid nodes for each graph. (default: :obj:`None`)
-
-        Returns:
-            :class:`~tgp.select.SelectOutput`: The output of :math:`\texttt{select}` operator.
-        """
-        x = x.unsqueeze(0) if x.dim() == 2 else x  # dense case requires batch dimension
-        s, q_z = self._inner_forward(x)
-
-        if mask is not None:
-            s = s * mask.unsqueeze(-1)
-
-        return SelectOutput(s=s, s_inv_op=self.s_inv_op, mask=mask, q_z=q_z)
-
-
-class DPSelectSparse(DPSelect):
-    is_dense = False
-
-    def forward(
-        self, x: Tensor, batch: Optional[Tensor] = None, **kwargs
-    ) -> SelectOutput:
-        r"""Applies the Dirichlet Process selection operator to compute cluster assignments. This select operator works
-        with a sparse graphs representation, i.e., the input tensor :obj:`"x"` is expected to
-        be of shape :math:`\mathbb{R}^{N \times F}`.
-
-        If :obj:`batch` is provided and contains multiple graphs (different batch values),
-        the assignment matrix :math:`\mathbf{S}` is returned as a block-diagonal
-        :class:`~torch_sparse.SparseTensor` of shape :math:`\mathbb{R}^{N \times (B \times K)}`.
-        If :obj:`batch` is provided but all entries are equal (single-graph batch), or if
-        :obj:`batch` is :obj:`None`, the method returns a dense assignment matrix of shape
-        :math:`\mathbb{R}^{N \times K}` (using the dense path for efficiency).
-
-        Args:
-            x (~torch.Tensor): Node feature tensor
-                :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`, where :math:`N`
-                is the total number of nodes in the batch and :math:`F` is the
-                feature dimension.
-            batch (~torch.Tensor, optional): The batch vector
-                :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which indicates
-                to which graph in the batch each node belongs. Single-graph batches
-                (where all entries are equal) automatically use the dense representation
-                for efficiency.
+            x (~torch.Tensor): Node feature tensor.
+                If :obj:`batched_representation=True`, expected shape is :math:`\mathbb{R}^{B \times N \times F}`.
+                If :obj:`batched_representation=False`, expected shape is :math:`\mathbb{R}^{N \times F}`,
+                where :math:`N` is the total number of nodes across all graphs in the batch.
+            mask (~torch.Tensor, optional): Mask matrix :math:`\mathbf{M} \in {\{ 0, 1 \}}^{B \times N}`
+                indicating the valid nodes for each graph. Only used when :obj:`batched_representation=True`.
+                (default: :obj:`None`)
+            batch (~torch.Tensor, optional): The batch vector :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`,
+                which indicates to which graph in the batch each node belongs.
+                Only used when :obj:`batched_representation=False`.
                 (default: :obj:`None`)
 
         Returns:
             :class:`~tgp.select.SelectOutput`: The output of :math:`\texttt{select}` operator.
+                If :obj:`batched_representation=True`, the assignment matrix :math:`\mathbf{S}` has shape
+                :math:`\mathbb{R}^{B \times N \times K}`.
+                If :obj:`batched_representation=False`, the assignment matrix :math:`\mathbf{S}` has shape
+                :math:`\mathbb{R}^{N \times K}`.
         """
-        s, q_z = self._inner_forward(x)
+        if self.batched_representation:
+            # Batched representation: [B, N, F] -> [B, N, K]
+            x = x.unsqueeze(0) if x.dim() == 2 else x
+            s, q_z = self._inner_forward(x)
 
-        # Single-graph batch: use dense path (more efficient than sparse for single graph)
-        if batch is None:
-            return SelectOutput(s=s, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s)
+            if mask is not None:
+                s = s * mask.unsqueeze(-1)
 
-        # Check if it's a single-graph batch (all batch values are the same)
-        if batch.numel() > 0:
-            batch_min = int(batch.min().item())
-            batch_max = int(batch.max().item())
-            if batch_min == batch_max:
-                # Single graph: use dense path (more efficient than sparse for single graph)
-                return SelectOutput(
-                    s=s, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s
-                )
+            return SelectOutput(s=s, s_inv_op=self.s_inv_op, mask=mask, q_z=q_z)
+        else:
+            # Unbatched representation: [N, F] -> [N, K]
+            assert x.dim() == 2, "x must be of shape [N, F]"
+            s, q_z = self._inner_forward(x)
 
-        # Multi-graph batch: use sparse case (block-diagonal structure)
-        dev = x.device
-        row = torch.arange(x.size(0), device=dev).view(-1, 1).repeat(1, self.k).view(-1)
-        col = (self.k * batch.view(-1, 1) + torch.arange(self.k, device=dev)).view(-1)
-        # s_block = torch.sparse_coo_tensor(values=s.view(-1), indices=torch.stack([row, col], dim=0), is_coalesced=True) # TODO: this will be used in the new version of TGP without torch_sparse. Leave it here commented for now
-        s_block = torch_sparse.SparseTensor(row=row, col=col, value=s.view(-1))
-        return SelectOutput(
-            s=s_block, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s
-        )
+            return SelectOutput(
+                s=s, s_inv_op=self.s_inv_op, q_z=q_z, node_assignment=s, batch=batch
+            )

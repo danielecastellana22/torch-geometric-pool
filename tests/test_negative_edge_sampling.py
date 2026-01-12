@@ -14,6 +14,7 @@ from torch_geometric.utils import (
 from tgp.utils import batched_negative_edge_sampling, negative_edge_sampling
 from tgp.utils.negative_edge_sampling import (
     edge_index_to_vector_id,
+    sample_almost_k_edges,
     vector_id_to_edge_index,
 )
 
@@ -107,6 +108,23 @@ def test_negative_edge_sampling_with_different_edge_density(set_random_seed):
                 )
 
 
+def test_sparse_negative_edge_sampling_warns_on_dense_graph(set_random_seed):
+    num_nodes = 4
+    total_edges = num_nodes * num_nodes
+    # Use a dense edge set to make prob_neg_edges < _MIN_PROB_EDGES
+    edge_ids = torch.arange(total_edges - 4)
+    row, col = vector_id_to_edge_index(edge_ids, (num_nodes, num_nodes))
+    edge_index = torch.stack([row, col], dim=0)
+
+    with pytest.warns(
+        UserWarning,
+        match="The probability of sampling a negative edge is too low",
+    ):
+        _ = negative_edge_sampling(
+            edge_index, num_nodes=num_nodes, num_neg_samples=2, method="sparse"
+        )
+
+
 def test_bipartite_negative_edge_sampling_with_different_edge_density():
     for num_nodes in [10, 100, 1000]:
         for p in [0.1, 0.3, 0.5, 0.8]:
@@ -185,3 +203,16 @@ def test_bipartite_batched_negative_edge_sampling(set_random_seed):
 
     assert (adj & neg_adj).sum() == 0
     assert (adj | neg_adj).sum() == edge_index.size(1) + neg_edge_index.size(1)
+
+
+def test_sample_almost_k_edges_caps_k():
+    size = (2, 2)
+    new_edge_index, new_edge_id = sample_almost_k_edges(
+        size=size,
+        k=10,
+        force_undirected=False,
+        remove_self_loops=False,
+        method="sparse",
+    )
+    assert new_edge_id.numel() <= size[0] * size[1]
+    assert new_edge_index.shape[0] == 2

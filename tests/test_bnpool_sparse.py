@@ -6,8 +6,10 @@ import pytest
 import torch
 from torch_geometric.data import Batch, Data
 from torch_geometric.utils import erdos_renyi_graph
+from torch_sparse import SparseTensor
 
 from tgp.poolers.bnpool_sparse import SparseBNPool
+from tgp.select import DPSelect
 
 
 @pytest.fixture
@@ -154,8 +156,8 @@ def test_sparse_bnpool_training_modeon_single_graph(single_sparse_graph, train_k
 def test_sparse_bnpool_single_graph_with_batch_vector(single_sparse_graph, train_k):
     """Test BNPool with a single graph that has a batch vector (all values same).
 
-    This tests the new behavior where DPSelectSparse automatically uses the dense
-    path for single-graph batches, which is useful when DataLoaders produce
+    This tests the behavior where DPSelect with batched_representation=False uses the dense
+    [N, K] representation for single-graph batches, which is useful when DataLoaders produce
     single-graph batches (e.g., last batch when batch_size * N + 1 graphs).
     """
     s_graph = single_sparse_graph
@@ -229,14 +231,34 @@ def test_sparse_bnpool_eval_mode(small_batched_sparse_graphs):
     )
 
 
-@pytest.mark.parametrize("rescale_loss", [False, True])
-@pytest.mark.parametrize("balance_links", [False, True])
-def test_sparse_bnpool_with_mask_patterns_rescale_and_balance(
-    small_batched_sparse_graphs, rescale_loss, balance_links
-):
-    """Test BNPool with different mask patterns."""
-    # TODO: to do
-    pass
+def test_dpselect_sparse_multi_graph_returns_dense():
+    """Test that DPSelect with batched_representation=False returns a dense [N, K] tensor for multi-graph batches.
+
+    The dense representation is more memory-efficient and faster to compute
+    compared to block-diagonal sparse representation.
+    """
+    x = torch.randn(6, 4)
+    batch = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long)
+    selector = DPSelect(in_channels=4, k=3, batched_representation=False)
+    so = selector(x=x, batch=batch)
+
+    # Returns dense [N, K] tensor instead of block-diagonal SparseTensor [N, B*K]
+    assert isinstance(so.s, torch.Tensor)
+    assert not isinstance(so.s, SparseTensor)
+    assert so.s.shape == (6, 3)  # [N, K] not [N, B*K]
+
+
+# def test_dpselect_sparse_empty_batch_returns_dense():
+#     """Test DPSelect with batched_representation=False with empty batch returns dense tensor."""
+#     x = torch.empty((0, 4))
+#     batch = torch.empty((0,), dtype=torch.long)
+#     selector = DPSelect(in_channels=4, k=3, batched_representation=False)
+#     so = selector(x=x, batch=batch)
+
+#     # Returns dense [N, K] tensor
+#     assert isinstance(so.s, torch.Tensor)
+#     assert so.s.shape[0] == 0  # Empty tensor
+#     assert so.s.shape[1] == 3  # K clusters
 
 
 def test_sparse_bnpool_lifting_operation(small_batched_sparse_graphs):

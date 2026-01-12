@@ -13,17 +13,15 @@ from tgp.select import SelectOutput
 from tgp.utils import connectivity_to_edge_index, connectivity_to_sparse_tensor
 
 
-class DenseConnectSPT(Connect):
-    r"""A :math:`\texttt{connect}` operator to be used when the assignment matrix
-    :math:`\mathbf{S}` in the :class:`~tgp.select.SelectOutput` is a :class:`SparseTensor`
-    with a block diagonal structure, and each block is dense. For single-graph
-    batches, :math:`\mathbf{S}` may be provided as a dense tensor.
+class DenseConnectUnbatched(Connect):
+    r"""A :math:`\texttt{connect}` operator for *unbatched* dense assignment matrices.
 
-    This operator supports two representations of :math:`\mathbf{S}`:
-    (i) a block-diagonal :class:`~torch_sparse.SparseTensor` of shape :math:`[N, B \cdot K]`,
-    where each dense block corresponds to a graph in the batch; or
-    (ii) a dense tensor of shape :math:`[N, K]`, where :math:`N = \sum_i N_i` is the
-    total number of nodes across the batch and :math:`K` is the number of clusters.
+    This operator is intended for selection matrices :math:`\mathbf{S}` stored as a
+    dense tensor of shape :math:`[N, K]`, where :math:`N=\sum_i N_i` is the total
+    number of nodes across a mini-batch of graphs and :math:`K` is the number of
+    clusters per graph. The `batch` vector is used to split :math:`\mathbf{S}` and
+    the input adjacency into per-graph blocks, and the pooled adjacency is returned
+    as a block-diagonal matrix of shape :math:`[B \cdot K, B \cdot K]`.
 
     The pooled adjacency matrix is computed as:
 
@@ -80,9 +78,9 @@ class DenseConnectSPT(Connect):
                 :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which indicates
                 to which graph in the batch each node belongs. (default: :obj:`None`)
             so (~tgp.select.SelectOutput):
-                The output of the :math:`\texttt{select}` operator. For batched inputs,
-                :attr:`so.s` can be either a block-diagonal :class:`~torch_sparse.SparseTensor`
-                of shape :math:`[N, B \cdot K]` or a dense :math:`[N, K]` tensor.
+                The output of the :math:`\texttt{select}` operator.
+                Expects :attr:`so.s` to be a dense tensor of shape :math:`[N, K]`
+                (or :math:`[1, N, K]` for a single graph).
             batch_pooled (~torch.Tensor, optional):
                 Batch vector which assigns each supernode to a specific graph.
                 Required when edge_weight_norm=True for per-graph normalization.
@@ -97,7 +95,7 @@ class DenseConnectSPT(Connect):
         if self.edge_weight_norm and batch_pooled is None:
             raise AssertionError(
                 "edge_weight_norm=True but batch_pooled=None. "
-                "batch_pooled parameter is required for per-graph normalization in DenseConnectSPT."
+                "batch_pooled parameter is required for per-graph normalization in DenseConnectUnbatched."
             )
 
         convert_back = False
@@ -111,14 +109,15 @@ class DenseConnectSPT(Connect):
             BS = 1 if batch is None else batch.max().item() + 1
 
             if BS == 1:  # There is only one graph, no need to iterate
-                if isinstance(so.s, SparseTensor):
-                    s = so.s.to_dense()
-                else:
-                    s = so.s
+                if not isinstance(so.s, Tensor):
+                    raise TypeError(
+                        "DenseConnectUnbatched expects a dense Tensor assignment matrix."
+                    )
+                s = so.s
                 if s.dim() == 3:
                     if s.size(0) != 1:
                         raise ValueError(
-                            "DenseConnectSPT expects a 2D assignment matrix for a single graph."
+                            "DenseConnectUnbatched expects a 2D assignment matrix for a single graph."
                         )
                     s = s.squeeze(0)
                 num_nodes = s.size(0)
@@ -141,29 +140,16 @@ class DenseConnectSPT(Connect):
                 if edge_weight is None:
                     edge_weight = torch.ones(E, device=dev)
 
-                if isinstance(so.s, SparseTensor):
-                    # Block-diagonal sparse S with shape [N, B*K].
-                    row, col, val = so.s.coo()
-                    if so.s.size(1) % BS != 0:
-                        raise ValueError(
-                            "DenseConnectSPT expects a block-diagonal assignment matrix "
-                            "with second dimension divisible by the batch size."
-                        )
-                    K = so.s.size(1) // BS
-                    col = col % K
-                    s = torch.sparse_coo_tensor(
-                        indices=torch.stack([row, col], dim=0),
-                        values=val,
-                        size=(so.s.size(0), K),
-                    ).to_dense()  # dense matrix [N x K]
-                else:
-                    # Thiis is already a dense matrix [N x K]
-                    s = so.s
-                    if s.dim() != 2:
-                        raise ValueError(
-                            "DenseConnectSPT expects a 2D assignment matrix for batched graphs."
-                        )
-                    K = s.size(1)
+                if not isinstance(so.s, Tensor):
+                    raise TypeError(
+                        "DenseConnectUnbatched expects a dense Tensor assignment matrix."
+                    )
+                s = so.s
+                if s.dim() != 2:
+                    raise ValueError(
+                        "DenseConnectUnbatched expects a 2D assignment matrix for batched graphs."
+                    )
+                K = s.size(1)
 
                 unbatched_s = unbatch(
                     s, batch=batch

@@ -113,7 +113,7 @@ def test_poolers_forward_and_lifting(simple_graph, pooler_name):
         batch=batch,
         use_cache=False,
     )
-    if pooler.is_dense:
+    if pooler.is_dense_batched:
         assert isinstance(adj_pre, torch.Tensor) and adj_pre.ndim == 3
     if mask is not None:
         assert isinstance(mask, torch.Tensor) and mask.dtype == torch.bool
@@ -134,7 +134,14 @@ def test_poolers_forward_and_lifting(simple_graph, pooler_name):
         assert 1 <= num_supernodes <= max_expected_supernodes
     else:
         assert 1 <= num_supernodes <= N
-    assert 1 <= out.x.size(0) <= num_supernodes
+
+    # For dense [N, K] assignment matrices with multi-graph batches (e.g., SparseBNPool),
+    # the actual output has B*K nodes, while num_supernodes = K (clusters per graph).
+    # For sparse block-diagonal assignments, num_supernodes = B*K.
+    actual_max_supernodes = (
+        max_expected_supernodes if batch is not None else num_supernodes
+    )
+    assert 1 <= out.x.size(0) <= actual_max_supernodes
 
     ei = out.edge_index
     assert isinstance(ei, torch.Tensor)
@@ -146,13 +153,16 @@ def test_poolers_forward_and_lifting(simple_graph, pooler_name):
         assert ew.numel() == ei.size(1)
 
     # Apply message passing to ensure output is correct type
-    conv = GCNConv(F, F) if not pooler.is_dense else DenseGCNConv(F, F)
+    conv = GCNConv(F, F) if not pooler.is_dense_batched else DenseGCNConv(F, F)
     out.x = conv(out.x, out.edge_index)
     assert isinstance(out.x, torch.Tensor)
 
     # Lifting check
     x_pool = out.x.clone()
-    x_lifted = pooler(x=x_pool, so=out.so, lifting=True)
+    lift_kwargs = {}
+    if pooler_name in {"lap", "spbnpool"}:
+        lift_kwargs["batch_pooled"] = out.batch
+    x_lifted = pooler(x=x_pool, so=out.so, lifting=True, **lift_kwargs)
     assert isinstance(x_lifted, torch.Tensor)
     # For batched graphs, the lifted features should match the number of nodes
     # that the SelectOutput knows about. Some poolers may only lift one graph at a time
